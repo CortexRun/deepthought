@@ -1,0 +1,3 @@
+# Corpus PDFs go here (not committed)
+*.pdf
+!.gitignore

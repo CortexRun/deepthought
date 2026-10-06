@@ -1,40 +1,51 @@
 # deepthought
 
-A local RAG assistant that runs entirely on a Jetson Orin Nano (8 GB). No cloud, no API keys: Ollama for the LLM and embeddings, PostgreSQL + pgvector for retrieval, LangGraph for the control flow, FastAPI in front.
+A local RAG assistant that answers questions about an operating-systems textbook and runs entirely on a Jetson Orin Nano (8 GB). No cloud, no API keys: Ollama for the LLM and embeddings, PostgreSQL + pgvector for retrieval, LangGraph for the control flow, FastAPI in front.
 
-Built as a university team project (FOM, 2025–2026); I implemented the whole stack. The interesting part is not the RAG itself but what 8 GB of shared memory forces you to do differently.
-
-<!-- TODO Andi: ein Satz, was der Use Case war (Fragen zum OS-Lehrbuch beantworten, Zielgruppe?) -->
+Built as a university team project (FOM, "Projekt Edge Computing", WS 2025). I did the initial device bring-up and implemented the stack; a teammate did the OS hardening. The interesting part is not the RAG itself but what 8 GB of shared memory forces you to do differently.
 
 ## What it does
 
-1. **Preprocessing** – translates the question to English (small models are noticeably better at English) and embeds it (`nomic-embed-text`).
+1. **Preprocessing** – translates the question to English and embeds it (`nomic-embed-text`).
 2. **Routing** – a structured-output call classifies the intent: `operating_system` → retrieval, `general` → plain chat.
-3. **Execution** – either a pgvector similarity search over the chunked textbook, or a short chat completion over the last four messages.
+3. **Execution** – either a pgvector cosine search over the chunked textbook, or a short chat completion over the last four messages.
 4. **Answer** – one final rephrasing call. Retrieval answers must cite page numbers `(Page X)` and may only use the retrieved text.
 
 ![graph](docs/graph.png)
 
 ## Why it looks like this
 
-**Routing instead of ReAct.** The first version was a ReAct agent with the retrieval as a tool. On a 3B model that was not stable: <!-- TODO Andi: was genau ist passiert? Tool-Calls kaputt formatiert / Endlosschleifen / Halluzinierte Tool-Namen? Welches Modell? --> Replacing the loop with one structured-output classification (`IntentResult`, Pydantic schema enforced by Ollama) made the behaviour deterministic enough to ship: the model decides *once*, the graph does the rest.
+**Routing instead of ReAct.** The first version was a ReAct agent with retrieval as a tool. Yao et al. already note that small models do not process ReAct's reasoning chains stably, and that matched what we saw on a 3B model: it worked once, and otherwise either looped without ever producing a final answer or never got the reason/act decision right. Replacing the loop with one structured-output classification (`IntentResult`, a Pydantic schema enforced by Ollama) made the behaviour deterministic enough to ship: the model decides *once*, the graph does the rest. `granite4:3b` was chosen because it supports function calling and structured output at a size that fits next to the embedding model.
 
-**Translate first.** <!-- TODO Andi: warum der Übersetzungsschritt — deutsche Fragen von Nutzern, aber Korpus und kleine Modelle englisch? Hat es messbar geholfen? -->
+**Translate first.** `granite4:3b` is labelled multilingual, but its training data is predominantly English, so English is the language it handles most reliably. Users ask in German; the translation step also silently fixes typos before the question is embedded.
 
-**Bounding memory and latency.** Everything on the Jetson shares the same 8 GB with the OS. The knobs that matter:
+**Bounding memory and latency.** Self-attention is quadratic in context length, and on the Jetson the LLM, the embedding model, Postgres and the OS share the same 8 GB. The knobs that matter:
 - chat history is truncated to the last 4 messages before the final call,
 - `top_k = 2` chunks of 500 characters (100 overlap) per retrieval,
 - `num_predict = 2048`, `temperature = 0.2`.
 
-<!-- TODO Andi: eine Zahl wäre gut — Antwortlatenz p50 auf dem Jetson, oder RAM-Verbrauch mit granite4:3b + nomic-embed geladen -->
+Answers took several seconds on the device; I did not keep measurements.
 
-**Models.** `LlmApiModel` in `src/context/deepthought_context.py` is the list of what I tried. `granite4:3b` is the one that runs reliably on the device. <!-- TODO Andi: 1–2 Sätze, warum die anderen rausgefallen sind (zu langsam / zu viel RAM / Structured Output nicht stabil) -->
+**Models.** `LlmApiModel` in `src/context/deepthought_context.py` lists what I tried. `granite4:3b` was the first model where structured output and function calling were stable at a size that fits next to the embedding model; I did not keep systematic notes on why the others fell out, so the enum is a record of what was tried, not a ranking.
 
 **Chunking by characters, per page.** Pages are chunked individually so every chunk carries its page number, which is what makes the `(Page X)` citations possible. Character-based rather than token-based chunking keeps the ingestion dependency-free.
 
+**State across requests.** HTTP is stateless; LangGraph's `InMemorySaver` checkpointer keyed by `thread_id` carries the conversation between calls. In-memory is fine for a prototype and costs nothing on the device; it does not survive a restart.
+
+## Device setup
+
+What it took to get a fresh Jetson Orin Nano into a state you can develop against remotely. The bring-up (first two points) was mine; hardening, kernel tuning and the database setup were done by a teammate and are listed because they are half the project.
+
+- JetPack flashed via SD card, firmware updated, system brought to a usable baseline.
+- Root filesystem migrated from SD card to NVMe (`parted`, `rsync`, boot entry in `/boot/extlinux/extlinux.conf`); the bootloader stays on the SD card as NVIDIA recommends.
+- iptables with default `DROP` on `INPUT`; only established/related, 22 (SSH), 5432 (Postgres) and 8000 (FastAPI) are open. `avahi-daemon` disabled. Tailscale for remote access, since the team was spread across Germany.
+- Kernel tuned for Postgres: `vm.swappiness = 10`, `vm.overcommit_memory` / `vm.overcommit_ratio` set so the database is not OOM-killed under memory pressure, persisted via `/etc/sysctl.d/`.
+- PostgreSQL 18 from the official repository, cluster re-created with `scram-sha-256`, pgvector compiled from source.
+- Ollama and the API run as systemd services.
+
 ## Stack
 
-LangGraph 1.x (two compiled subgraphs inside a main graph, `InMemorySaver` checkpointer keyed by `thread_id`) · LangChain-Ollama · PostgreSQL + pgvector (768-dim, cosine) · FastAPI/uvicorn · pypdf · uv
+LangGraph 1.x (two compiled subgraphs inside a main graph) · LangChain-Ollama · PostgreSQL 18 + pgvector (768-dim, cosine) · FastAPI/uvicorn · pypdf · uv · Ubuntu 22.04 on JetPack 6
 
 ## Running it
 
@@ -59,14 +70,15 @@ curl -X POST localhost:8000/start \
   -d '{"thread_id": "demo", "user_question": "Was ist ein Context Switch?"}'
 ```
 
-The corpus used during the project is Max Hailperin's *Operating Systems and Middleware* (<!-- TODO Andi: Lizenz prüfen; meines Wissens CC BY-SA 3.0, dann hier verlinken und das PDF aus dem Repo nehmen -->).
+The corpus is Max Hailperin's *[Operating Systems and Middleware: Supporting Controlled Interaction](https://gustavus.edu/mcs/max/os-book/)* (CC BY-SA 3.0). Download the PDF from the author's site and place it at `src/db/documents/Operating_Systems.pdf` before running the ingestion notebook; it is not committed here.
 
 ## What I would do differently
 
 - Connection pooling instead of one Postgres connection per request.
 - Return partial state updates from the LangGraph nodes instead of mutating the `TypedDict` in place; it works, but it is not idiomatic.
-- Token-based chunking and a proper eval set: right now "does it cite the right page" is checked by hand.
-- <!-- TODO Andi: dein eigener Punkt -->
+- Hybrid retrieval: BM25 next to the cosine search, so exact terms like syscall names are not lost in the embedding.
+- Token-based chunking and a real eval set: right now "does it cite the right page" is checked by hand.
+- A persistent checkpointer once the prototype has to survive restarts.
 
 ## Layout
 
